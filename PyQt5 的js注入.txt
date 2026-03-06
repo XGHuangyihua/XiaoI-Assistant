@@ -1,0 +1,28 @@
+请问一下，你是怎么实现JS自动填写的，你几次失败后成功的要点是什么？
+关键点是 PyQt5 的 runJavaScript 不支持 async/await。
+
+过程：
+
+第一次：直接使用原 JS 文件的 async/await 语法 → 返回空对象 {} → 失败
+第二次：更新了选择器（从 div._7436101 改为 [class*="_7436101"]）→ 仍然返回 {} → 失败
+第三次：加了调试日志，看到返回 {} 而不是错误信息，确定是 JS 没执行成功
+第四次：改用同步写法（去掉 async/await，用 while 循环轮询）：
+用 while + Date.now() 替代 await + Promise
+用 var 替代 const
+去掉箭头函数
+核心原因：PyQt5 的 QWebEnginePage.runJavaScript() 对 async 函数支持不完整，需要用传统同步 JS 写法。
+
+代码对比如下：
+
+// ❌ 不行 (async/await)
+const inputBox = await waitForElement(...);
+
+// ✅ 可以 (同步 while)
+var inputBox = waitForElement(...);
+function waitForElement(selector, timeout) {
+    while (Date.now() - start < timeout) {
+        var el = document.querySelector(selector);
+        if (el) return el;
+    }
+    return null;
+}

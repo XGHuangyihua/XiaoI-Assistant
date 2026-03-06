@@ -1,0 +1,1 @@
+注意：PyQtWebEngine 在某些情况下可能需要 Microsoft Visual C++ Redistributable 运行库，如果遇到报错可以尝试安装 vc_redist.x64.exe。
