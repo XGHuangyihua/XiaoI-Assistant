@@ -4,7 +4,7 @@
 添加120秒总超时控制
 """
 
-VERSION = "1.2.0"
+VERSION = "1.2.1"
 
 import os
 
@@ -92,6 +92,11 @@ class XiaoIWindow(QMainWindow):
         self.initial_count = 0
         self.polling_timeout = 30
         self.polling_interval = 3000
+        self.last_message_increase_time = None  # 最后一次检测到新消息的时间
+        self.no_new_message_timeout = 60  # 无新消息超时时间（秒）
+        self.last_polled_count = 0  # 上一次轮询的消息数量
+        self.last_message_length = 0  # 上一次轮询的消息字符数
+        self.temp_polling_timeout = None  # 临时超时值，轮询结束后恢复
 
         # 内容稳定检测相关变量
         self.stable_timer = None
@@ -100,10 +105,6 @@ class XiaoIWindow(QMainWindow):
         self.stable_check_count = 0
         self.stable_timeout = 120
         self.stable_interval = 3000
-
-        # 总超时控制（120秒）
-        self.global_timeout_timer = None
-        self.global_timeout_seconds = 120
 
         # Program end 标记检测
         self.program_end_timer = None
@@ -353,35 +354,10 @@ class XiaoIWindow(QMainWindow):
         return template.replace("{task}", task)
 
     # ---------- 总超时控制 ----------
-    def start_global_timeout(self):
-        """启动120秒总超时定时器"""
-        self.stop_global_timeout()  # 先停止可能存在的旧定时器
-        self.global_timeout_timer = QTimer()
-        self.global_timeout_timer.setSingleShot(True)
-        self.global_timeout_timer.timeout.connect(self.on_global_timeout)
-        self.global_timeout_timer.start(self.global_timeout_seconds * 1000)
-        self.log(f"⏱️ 启动总超时定时器（{self.global_timeout_seconds}秒）")
-
-    def stop_global_timeout(self):
-        """停止总超时定时器"""
-        if self.global_timeout_timer:
-            self.global_timeout_timer.stop()
-            self.global_timeout_timer = None
-
-    def on_global_timeout(self):
-        """总超时触发时的处理"""
-        self.log(
-            f"❌ 超时：{self.global_timeout_seconds}秒内未获取到完整的代码（未检测到 #Program start 和 #Program end）"
-        )
-        self.stop_polling()
-        self.stop_program_end_check()
-        self.global_timeout_timer = None
-
     # ---------- 发送任务 ----------
     def send_task_to_deepseek(self):
         self.stop_polling()
         self.stop_program_end_check()
-        self.stop_global_timeout()
 
         task = self.task_input.toPlainText().strip()
         if not task:
@@ -460,7 +436,6 @@ class XiaoIWindow(QMainWindow):
             self.log("⏳ 正在等待回复...")
 
             self.get_initial_message_count()
-            self.start_global_timeout()
             self.start_polling()
 
         self.browser.page().runJavaScript(js_code, handle_js_result)
@@ -539,8 +514,11 @@ class XiaoIWindow(QMainWindow):
             self.log(f"✅ 已发送任务到{self.current_model}")
             self.log("⏳ 正在等待回复...")
 
+            # DeepSeek 生成回复较慢，增加轮询超时
+            self.temp_polling_timeout = 60
+            self.polling_timeout = 60
+
             self.get_initial_message_count()
-            self.start_global_timeout()
             self.start_polling()
 
         self.browser.page().runJavaScript(js_code, handle_js_result)
@@ -552,7 +530,7 @@ class XiaoIWindow(QMainWindow):
         self.log("=" * 40)
 
         # 千问生成回复较慢，增加轮询超时
-        original_timeout = self.polling_timeout
+        self.temp_polling_timeout = 60
         self.polling_timeout = 60
 
         # ========== 步骤1: 全屏模板匹配直接找输入框 ==========
@@ -625,11 +603,7 @@ class XiaoIWindow(QMainWindow):
         self.log("=" * 40)
 
         self.get_initial_message_count()
-        self.start_global_timeout()
         self.start_polling()
-
-        # 恢复默认轮询超时
-        self.polling_timeout = original_timeout
 
     # ---------- 轮询、稳定检测、提取等 ----------
     def get_initial_message_count(self):
@@ -643,21 +617,32 @@ class XiaoIWindow(QMainWindow):
             for (let selector of selectors) {{
                 let elements = document.querySelectorAll(selector);
                 if (elements.length > 0) {{
-                    return elements.length;
+                    let last = elements[elements.length - 1];
+                    let text = last.innerText || last.textContent || '';
+                    return JSON.stringify({{count: elements.length, length: text.length}});
                 }}
             }}
-            return 0;
+            return JSON.stringify({{count: 0, length: 0}});
         }})();
         """
 
-        def callback(count):
-            self.initial_count = count
-            self.log(f"📊 当前助手消息数量: {count}")
+        def callback(result):
+            try:
+                data = json.loads(result) if isinstance(result, str) else result
+                count = data.get("count", 0)
+                content_length = data.get("length", 0)
+                self.initial_count = count
+                self.last_polled_count = count
+                self.last_message_length = content_length
+                self.log(f"📊 当前助手消息数量: {count}, 字符数: {content_length}")
+            except Exception as e:
+                self.log(f"⚠️ 获取初始消息失败: {e}")
 
         self.browser.page().runJavaScript(js, callback)
 
     def start_polling(self):
         self.polling_start_time = time.time()
+        self.last_message_increase_time = time.time()
         if self.polling_timer is None:
             self.polling_timer = QTimer()
             self.polling_timer.timeout.connect(self.check_new_message)
@@ -672,6 +657,10 @@ class XiaoIWindow(QMainWindow):
             self.polling_timer.stop()
             self.polling_timer = None
             self.polling_start_time = None
+        # 恢复临时超时的轮询设置
+        if self.temp_polling_timeout is not None:
+            self.polling_timeout = 30
+            self.temp_polling_timeout = None
 
     def check_new_message(self):
         config = MODEL_CONFIGS[self.current_model]
@@ -724,25 +713,52 @@ class XiaoIWindow(QMainWindow):
 
             current_count = data.get("count", 0)
             content = data.get("content", "")
+            content_length = len(content)
             elapsed = time.time() - self.polling_start_time
 
-            if elapsed > self.polling_timeout:
-                self.log("⏰ 轮询超时，尝试提取最后一条消息")
-                self.stop_polling()
-                self.extract_last_message()
-                return
+            # 检测到新消息或内容还在增长时更新最后新消息时间
+            is_new_or_growing = False
+            if current_count > self.last_polled_count:
+                is_new_or_growing = True
+                self.last_polled_count = current_count
+                self.log(
+                    f"✅ 检测到新消息 (数量: {current_count} > {self.last_polled_count - 1})"
+                )
+            elif content_length > self.last_message_length:
+                is_new_or_growing = True
+                self.log(
+                    f"📝 消息正在生成 (字符数: {content_length} > {self.last_message_length})"
+                )
 
+            if is_new_or_growing:
+                self.last_message_increase_time = time.time()
+                self.last_message_length = content_length
+                self.log("⏳ 等待 #Program end 标记...")
+            else:
+                # 内容停止增长时，检查无新消息超时
+                if self.last_message_increase_time is not None:
+                    no_new_msg_elapsed = time.time() - self.last_message_increase_time
+                    if no_new_msg_elapsed > self.no_new_message_timeout:
+                        self.log(
+                            f"⏰ 内容停止增长超时（{no_new_msg_elapsed:.0f}秒），尝试提取最后一条消息"
+                        )
+                        self.stop_polling()
+                        self.extract_last_message()
+                        return
+
+            # 检查是否收到结束标记
             if "#Program end" in content:
                 self.log("✅ 检测到 #Program end 标记，回复已完成")
                 self.stop_polling()
                 self.extract_last_message()
                 return
 
-            if current_count > self.initial_count:
-                self.log(
-                    f"✅ 检测到新消息 (数量: {current_count} > {self.initial_count})"
-                )
-                self.log("⏳ 等待 #Program end 标记...")
+            # 检查总超时
+            if elapsed > self.polling_timeout:
+                self.log("⏰ 轮询超时，尝试提取最后一条消息")
+                self.stop_polling()
+                self.extract_last_message()
+                return
 
         self.browser.page().runJavaScript(js, callback)
 
@@ -828,8 +844,10 @@ class XiaoIWindow(QMainWindow):
         """
 
         def handle_content(content):
-            # 无论成功与否，停止总超时
-            self.stop_global_timeout()
+            # 恢复临时超时的轮询设置
+            if self.temp_polling_timeout is not None:
+                self.polling_timeout = 30  # 恢复默认超时
+                self.temp_polling_timeout = None
 
             if content and len(content.strip()) > 0:
                 self.log(f"📥 成功提取到回复，长度: {len(content)} 字符")
@@ -858,7 +876,7 @@ class XiaoIWindow(QMainWindow):
 
         self.browser.page().runJavaScript(js, handle_content)
 
-    def execute_act_file(self, act_file, timeout=60):
+    def execute_act_file(self, act_file, timeout=360):
         """执行 act.py 文件（与原来相同）"""
         try:
             self.log("🚀 正在自动执行生成的代码...")
@@ -966,7 +984,6 @@ class XiaoIWindow(QMainWindow):
     def closeEvent(self, event):
         self.stop_polling()
         self.stop_program_end_check()
-        self.stop_global_timeout()
         self.log("🔄 正在关闭程序...")
         event.accept()
 
